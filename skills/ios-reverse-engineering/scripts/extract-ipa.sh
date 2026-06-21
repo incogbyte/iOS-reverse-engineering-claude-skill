@@ -211,8 +211,20 @@ extract_entitlements() {
   elif command -v jtool2 &>/dev/null; then
     echo "  Extracting entitlements with jtool2..."
     jtool2 --ent "$binary" > "$dest/entitlements.plist" 2>/dev/null || true
+  elif command -v ipsw &>/dev/null; then
+    # Cross-platform fallback (Linux): ipsw macho info -e prints entitlements
+    echo "  Extracting entitlements with ipsw..."
+    local ent
+    ent=$(ipsw_macho_info "-e" "$binary")
+    if [[ -n "$ent" ]] && ! grep -qi 'no entitlement' <<<"$ent"; then
+      printf '%s\n' "$ent" > "$dest/entitlements.plist"
+      echo "  Entitlements extracted"
+    else
+      echo "  No entitlements found (unsigned or stripped)"
+      rm -f "$dest/entitlements.plist"
+    fi
   else
-    echo "  (codesign not available — skipping entitlements)"
+    echo "  (codesign/jtool2/ipsw not available — skipping entitlements)"
   fi
 }
 
@@ -315,6 +327,38 @@ extract_strings() {
   fi
 }
 
+# --- Helper: pick a --arch arg for ipsw on a (possibly fat) Mach-O ---
+# Echoes "--arch <arch>" if the binary is fat/universal and an arch can be determined,
+# otherwise echoes "" (single-arch binaries don't trigger ipsw's interactive arch selector).
+# Passing --arch explicitly is what lets `ipsw macho info` run non-interactively on fat binaries.
+_ipsw_arch_arg() {
+  local binary="$1"
+  if ! file "$binary" 2>/dev/null | grep -qi 'universal\|fat'; then
+    echo ""
+    return
+  fi
+  local arch="$THIN_ARCH"
+  if [[ -z "$arch" ]]; then
+    # First arch from `file` output, e.g. "[x86_64:Mach-O ...] [arm64:...]" -> x86_64
+    arch=$(file "$binary" 2>/dev/null | grep -oE '\[[a-z0-9_]+:' | head -1 | tr -d '[]:')
+  fi
+  if [[ -n "$arch" ]]; then
+    echo "--arch $arch"
+  else
+    echo "--arch arm64"   # iOS default fallback
+  fi
+}
+
+# --- Helper: run `ipsw macho info` non-interactively (arch-aware, no color) ---
+# $1 = info flag(s) e.g. "-d", "-l", "-e", "-o", "-n";  $2 = binary
+ipsw_macho_info() {
+  local flags="$1" binary="$2"
+  local archarg
+  archarg=$(_ipsw_arch_arg "$binary")
+  # shellcheck disable=SC2086
+  ipsw macho info --no-color $archarg $flags "$binary" 2>/dev/null || true
+}
+
 # --- Helper: analyze Mach-O binary ---
 analyze_macho() {
   local binary="$1"
@@ -329,20 +373,27 @@ analyze_macho() {
   if command -v lipo &>/dev/null; then
     echo "  Architectures:"
     lipo -info "$binary" 2>/dev/null | tee -a "$dest/binary-info.txt" || true
+  elif command -v ipsw &>/dev/null; then
+    # Linux: no lipo; record arch from ipsw header
+    ipsw_macho_info "-d" "$binary" | grep -iE '^(Magic|Type|CPU)' >> "$dest/binary-info.txt" || true
   fi
 
-  # Handle fat binary thinning
-  if [[ -n "$THIN_ARCH" ]] && command -v lipo &>/dev/null; then
-    local thin_binary="$dest/$(basename "$binary")-${THIN_ARCH}"
-    if lipo -thin "$THIN_ARCH" "$binary" -output "$thin_binary" 2>/dev/null; then
-      echo "  Thinned to $THIN_ARCH: $thin_binary"
-      binary="$thin_binary"
+  # Handle fat binary thinning (macOS lipo; cross-platform ipsw macho lipo)
+  if [[ -n "$THIN_ARCH" ]]; then
+    if command -v lipo &>/dev/null; then
+      local thin_binary="$dest/$(basename "$binary")-${THIN_ARCH}"
+      if lipo -thin "$THIN_ARCH" "$binary" -output "$thin_binary" 2>/dev/null; then
+        echo "  Thinned to $THIN_ARCH: $thin_binary"
+        binary="$thin_binary"
+      else
+        echo "  [WARN] Could not thin to $THIN_ARCH — using fat binary (ipsw will use --arch)"
+      fi
     else
-      echo "  [WARN] Could not thin to $THIN_ARCH — using fat binary"
+      echo "  [NOTE] lipo unavailable — keeping fat binary; ipsw uses --arch $THIN_ARCH"
     fi
   fi
 
-  # Shared libraries / linked frameworks
+  # Shared libraries / linked frameworks / load commands / ObjC / header flags
   if command -v otool &>/dev/null; then
     echo "  Linked libraries:"
     otool -L "$binary" 2>/dev/null | tee "$dest/linked-libraries.txt"
@@ -358,27 +409,52 @@ analyze_macho() {
     else
       rm -f "$dest/objc-info.txt"
     fi
+
+    # Mach-O header flags (PIE etc.) — for the hardening audit
+    otool -hv "$binary" 2>/dev/null > "$dest/macho-flags.txt" || true
+  elif command -v ipsw &>/dev/null; then
+    # Linux / no-otool fallback: ipsw macho info provides all of the above
+    echo "  Linked libraries (via ipsw):"
+    ipsw_macho_info "-l" "$binary" | grep -E 'LC_LOAD_DYLIB' | tee "$dest/linked-libraries.txt" || true
+
+    ipsw_macho_info "-l" "$binary" > "$dest/load-commands.txt" || true
+    [[ -s "$dest/load-commands.txt" ]] && echo "  Load commands saved to load-commands.txt" || rm -f "$dest/load-commands.txt"
+
+    ipsw_macho_info "-o" "$binary" > "$dest/objc-info.txt" || true
+    if [[ -s "$dest/objc-info.txt" ]] && ! grep -qi 'no objc' "$dest/objc-info.txt"; then
+      echo "  Objective-C metadata saved to objc-info.txt"
+    else
+      rm -f "$dest/objc-info.txt"
+    fi
+
+    # Mach-O header flags (PIE etc.) via ipsw macho info -d (header)
+    ipsw_macho_info "-d" "$binary" > "$dest/macho-flags.txt" || true
+    [[ -s "$dest/macho-flags.txt" ]] || rm -f "$dest/macho-flags.txt"
+  else
+    echo "  [WARN] Neither otool nor ipsw available — skipping Mach-O analysis"
   fi
 
-  # Symbol table
+  # Symbol table (nm is cross-platform via binutils; ipsw -n as fallback)
   if command -v nm &>/dev/null; then
     nm "$binary" 2>/dev/null > "$dest/symbols.txt" || true
-    if [[ -s "$dest/symbols.txt" ]]; then
-      local sym_count
-      sym_count=$(wc -l < "$dest/symbols.txt" | tr -d ' ')
-      echo "  Symbols: $sym_count"
+  elif command -v ipsw &>/dev/null; then
+    ipsw_macho_info "-n" "$binary" > "$dest/symbols.txt" || true
+  fi
+  if [[ -s "$dest/symbols.txt" ]]; then
+    local sym_count
+    sym_count=$(wc -l < "$dest/symbols.txt" | tr -d ' ')
+    echo "  Symbols: $sym_count"
 
-      if [[ "$SWIFT_DEMANGLE" == true ]]; then
-        if command -v swift-demangle &>/dev/null; then
-          swift-demangle < "$dest/symbols.txt" > "$dest/symbols-demangled.txt" 2>/dev/null
-        elif command -v swift &>/dev/null; then
-          swift demangle < "$dest/symbols.txt" > "$dest/symbols-demangled.txt" 2>/dev/null
-        fi
+    if [[ "$SWIFT_DEMANGLE" == true ]]; then
+      if command -v swift-demangle &>/dev/null; then
+        swift-demangle < "$dest/symbols.txt" > "$dest/symbols-demangled.txt" 2>/dev/null
+      elif command -v swift &>/dev/null; then
+        swift demangle < "$dest/symbols.txt" > "$dest/symbols-demangled.txt" 2>/dev/null
       fi
-    else
-      echo "  No symbols (stripped binary)"
-      rm -f "$dest/symbols.txt"
     fi
+  else
+    echo "  No symbols (stripped binary or no nm/ipsw)"
+    rm -f "$dest/symbols.txt"
   fi
 }
 
@@ -408,6 +484,19 @@ list_frameworks() {
     for ext_bundle in "$plugins_dir"/*; do
       echo "    - $(basename "$ext_bundle")"
     done
+  fi
+}
+
+# --- Helper: copy Apple privacy manifest (PrivacyInfo.xcprivacy) ---
+# The manifest is a plist with a non-.plist suffix, so the generic *.plist copy loop misses it.
+# It is required by Apple for apps/SDKs using required-reason APIs; surfaced for the privacy audit.
+copy_privacy_manifest() {
+  local app_dir="$1"
+  local dest="$2"
+  local manifest="$app_dir/PrivacyInfo.xcprivacy"
+  if [[ -f "$manifest" ]]; then
+    cp "$manifest" "$dest/PrivacyInfo.xcprivacy" 2>/dev/null || true
+    echo "  PrivacyInfo.xcprivacy copied"
   fi
 }
 
@@ -487,6 +576,9 @@ case "$INPUT_TYPE" in
       cp "$plist" "$OUTPUT_DIR/plists/$rel_name" 2>/dev/null || true
     done
 
+    # Apple privacy manifest (required-reason APIs)
+    copy_privacy_manifest "$APP_DIR" "$OUTPUT_DIR"
+
     # Cleanup
     rm -rf "$IPA_EXTRACT_DIR"
     ;;
@@ -520,6 +612,10 @@ case "$INPUT_TYPE" in
 
     echo "--- Frameworks ---"
     list_frameworks "$APP_DIR" "$OUTPUT_DIR"
+    echo
+
+    # Apple privacy manifest (required-reason APIs)
+    copy_privacy_manifest "$APP_DIR" "$OUTPUT_DIR"
     ;;
 
   framework)

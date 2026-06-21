@@ -6,8 +6,10 @@ set -euo pipefail
 errors=0
 missing_required=()
 missing_optional=()
+OS=$(uname -s)   # Darwin = macOS, Linux = Linux
 
 echo "=== iOS Reverse Engineering: Dependency Check ==="
+echo "OS: $OS"
 echo
 
 # --- ipsw (includes class-dump functionality) ---
@@ -34,13 +36,20 @@ if [[ "$ipsw_found" == false ]]; then
   missing_required+=("ipsw")
 fi
 
-# --- otool (part of Xcode Command Line Tools) ---
+# --- otool (part of Xcode Command Line Tools — macOS only; ipsw substitutes on Linux) ---
 if command -v otool &>/dev/null; then
   echo "[OK] otool detected"
 else
-  echo "[MISSING] otool is not installed (install Xcode Command Line Tools)"
-  errors=$((errors + 1))
-  missing_required+=("xcode-cli-tools")
+  if [[ "$OS" == "Darwin" ]]; then
+    echo "[MISSING] otool is not installed (install Xcode Command Line Tools)"
+    errors=$((errors + 1))
+    missing_required+=("xcode-cli-tools")
+  else
+    # Linux: otool is macOS-only. ipsw provides Mach-O analysis (header/load-commands/entitlements/
+    # symbols/lipo) as a cross-platform fallback — see extract-ipa.sh. Not blocking.
+    echo "[OPTIONAL] otool not available (macOS-only) — ipsw provides Mach-O analysis on Linux"
+    missing_optional+=("otool")
+  fi
 fi
 
 # --- strings ---
@@ -52,21 +61,24 @@ else
   missing_required+=("strings")
 fi
 
-# --- plutil ---
+# --- plutil (macOS) / plistutil (libplist) / python3 plistlib (cross-platform plist reader) ---
+# The scripts read plists via lib/plist.sh, which tries plutil -> PlistBuddy -> python3 -> plistutil.
 if command -v plutil &>/dev/null; then
   echo "[OK] plutil detected"
 elif command -v plistutil &>/dev/null; then
-  echo "[OK] plistutil detected (Linux alternative to plutil)"
+  echo "[OK] plistutil detected (libplist — Linux alternative to plutil)"
+elif command -v python3 >/dev/null 2>&1 && python3 -c 'import plistlib' 2>/dev/null; then
+  echo "[OK] python3 plistlib detected (cross-platform plist reader)"
 else
-  echo "[MISSING] plutil/plistutil not found (optional — needed for plist parsing)"
+  echo "[MISSING] no plist reader found (install plutil on macOS, or libplist-utils / python3 on Linux)"
   missing_optional+=("plutil")
 fi
 
-# --- codesign ---
+# --- codesign (macOS only; ipsw/jtool2 substitute for entitlements extraction on Linux) ---
 if command -v codesign &>/dev/null; then
   echo "[OK] codesign detected"
 else
-  echo "[MISSING] codesign not found (optional — macOS only, for entitlements extraction)"
+  echo "[OPTIONAL] codesign not found (macOS-only; entitlements also extractable via ipsw/jtool2)"
   missing_optional+=("codesign")
 fi
 

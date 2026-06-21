@@ -18,7 +18,40 @@ strings --version
 codesign --help
 ```
 
-> **Note**: On Linux, `otool` is not available. Use `objdump` or `rabin2` as alternatives. The `strings` command is part of `binutils`.
+### Linux
+
+`otool`/`codesign`/`plutil`/`PlistBuddy`/`lipo` are macOS-only — **but the skill does not require
+them on Linux.** The scripts auto-fallback to cross-platform equivalents:
+
+| macOS-only tool | Linux / cross-platform fallback used by the skill |
+|---|---|
+| `otool -L/-l/-oV/-hv` | `ipsw macho info -l/-o/-d` (linked libs, load commands, objc, flags) |
+| `codesign` / `jtool2` (entitlements) | `ipsw macho info -e` |
+| `lipo -info/-thin` | `ipsw macho info` arch line / `ipsw macho lipo --arch <arch>` |
+| `nm` | `nm` from **binutils** (often present on Linux); `ipsw macho info -n` otherwise |
+| `plutil` / `PlistBuddy` | `python3` plistlib (binary-plist capable) or `plistutil` (**libplist**) |
+
+So on Linux install **`ipsw`** (the cross-platform backbone), **`binutils`** (`strings`/`nm`),
+and a plist reader (**`libplist-utils`** or just **`python3`**):
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install binutils libplist-utils
+# ipsw from GitHub releases (see the ipsw section below)
+curl -LO https://github.com/blacktop/ipsw/releases/latest/download/ipsw_Linux_x86_64.tar.gz
+tar xzf ipsw_Linux_x86_64.tar.gz && mv ipsw ~/.local/bin/
+
+# Arch
+sudo pacman -S binutils libplist
+# Fedora
+sudo dnf install binutils libplist
+```
+
+Or let the installer handle it: `scripts/install-dep.sh xcode-cli-tools` installs `binutils` +
+`libplist` on Linux, and `scripts/install-dep.sh libplist` installs just the plist reader.
+
+> **Tip**: `check-deps.sh` exits 0 on Linux once `ipsw` + `strings` + a plist reader are present;
+> `otool`/`codesign`/`lipo` are reported as `INSTALL_OPTIONAL`, not required.
 
 ---
 
@@ -236,8 +269,9 @@ Ghidra provides full decompilation to C-like pseudocode, which is invaluable for
 | `ipsw: command not found` | Install via `brew install blacktop/tap/ipsw` or add to PATH |
 | ipsw class-dump outputs nothing | Binary may be encrypted (FairPlay). Decrypt first on jailbroken device |
 | ipsw class-dump limited Swift output | Use `dsdump --swift` or `nm` + `swift-demangle` for deeper analysis |
-| `otool: command not found` | Install Xcode Command Line Tools: `xcode-select --install` |
+| `otool: command not found` | Install Xcode Command Line Tools: `xcode-select --install` (macOS). On Linux this is expected — the scripts fall back to `ipsw macho info` automatically |
 | Fat binary issues | Use `lipo -thin arm64 binary -output binary-arm64` to extract one arch |
+| `ipsw macho info` prompts for architecture (hangs) | It opens an interactive TUI on fat/universal binaries. Pass `--arch arm64` (or thin first); the skill's scripts already pass `--arch` automatically |
 | Encrypted IPA from App Store | Must decrypt on jailbroken device or use `frida-ios-dump` |
 | `codesign` permission denied | May need to run with `sudo` or adjust entitlements |
 | jtool2 won't run on macOS | Right-click → Open, or `xattr -d com.apple.quarantine jtool2` |

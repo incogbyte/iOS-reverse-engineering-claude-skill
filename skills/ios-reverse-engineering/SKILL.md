@@ -9,7 +9,7 @@ Extract and analyze iOS IPA files, .app bundles, Mach-O binaries, dynamic librar
 
 ## Prerequisites
 
-This skill requires **ipsw** (which includes class-dump functionality and much more) and standard macOS developer tools (**otool**, **strings**, **plutil**, **codesign**). For deep binary analysis, **radare2** (or **rizin**) is recommended; **Ghidra headless** is optional for advanced decompilation. On macOS, most tools are available via Xcode Command Line Tools. On Linux, only static analysis of extracted files is supported. Run the dependency checker to verify:
+This skill requires **ipsw** (which includes class-dump functionality and much more) and, on macOS, the standard developer tools (**otool**, **strings**, **plutil**, **codesign**) via Xcode Command Line Tools. For deep binary analysis, **radare2** (or **rizin**) is recommended; **Ghidra headless** is optional for advanced decompilation. **On Linux**, `ipsw` provides cross-platform Mach-O analysis, entitlements, class-dump and thinning; `libplist`/`plistutil` (or `python3` plistlib) provide plist parsing; `binutils` provides `strings`/`nm`. `otool`/`codesign`/`plutil`/`PlistBuddy`/`lipo` are macOS-only and the scripts fall back to `ipsw`/`plistutil`/`python3` automatically — no macOS tools required on Linux. Run the dependency checker to verify:
 
 ```bash
 bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/check-deps.sh
@@ -58,11 +58,13 @@ Use the extraction script to process the target file. The script supports IPA, .
 bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/extract-ipa.sh [OPTIONS] <file>
 ```
 
-For **IPA** files: the script extracts the ZIP archive, locates the .app bundle inside `Payload/`, identifies the main Mach-O binary, runs `ipsw class-dump`, extracts Info.plist, entitlements, embedded frameworks, and string constants.
+For **IPA** files: the script extracts the ZIP archive, locates the .app bundle inside `Payload/`, identifies the main Mach-O binary, runs `ipsw class-dump`, extracts Info.plist, entitlements, embedded frameworks, string constants, the Mach-O header flags (`macho-flags.txt` — PIE / hardened-runtime indicators), and Apple's privacy manifest (`PrivacyInfo.xcprivacy`, copied to the analysis root when present).
 
-For **.app** bundles: the script works directly on the bundle directory.
+For **.app** bundles: the script works directly on the bundle directory (same artifacts as IPA).
 
 For **Mach-O** binaries, **.dylib**, and **.framework** files: the script runs `ipsw class-dump` and string extraction directly.
+
+On Linux, the Mach-O artifacts (`load-commands.txt`, `linked-libraries.txt`, `symbols.txt`, `macho-flags.txt`, `objc-info.txt`, entitlements) are produced via `ipsw macho info` instead of `otool`/`codesign`/`lipo`/`nm`, and plists are read via `python3` plistlib / `plistutil`. The output is equivalent to the macOS run.
 
 Options:
 - `-o <dir>` — Custom output directory (default: `<filename>-analysis`)
@@ -521,11 +523,19 @@ bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerab
 # Biometric/local-auth, sensitive-data logging, ATS detail, privacy/tracking, entitlements, debug artifacts
 bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --auth --logging --network --privacy --entitlements --debug
 
+# Mach-O hardening flags (non-PIE executable, no MH_NO_HEAP_EXECUTION, hardened-runtime weakening)
+bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --hardening
+
+# Data injection / dynamic dispatch (NSPredicate/NSExpression format strings, KVC, NSSelectorFromString/performSelector, stringWithFormat)
+bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --injection
+
 # Only high/critical findings
 bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --all --severity high --report vuln-report.md
 ```
 
-**Categories detected**: insecure local storage, WebView/JS-bridge, deeplink/URL-scheme hijack, weak crypto/RNG, biometric/local-auth patterns, sensitive-data logging, ATS detail (NSAllowsArbitraryLoads/ForMedia, NSMinimumTLSVersion, NSRequiresForwardSecrecy), cleartext/insecure-WebSocket, privacy/tracking (IDFA without ATT, pasteboard, screen-capture), entitlements risk (disable-library-validation, app groups, shared keychain), debug/staging artifacts.
+**Categories detected**: insecure local storage, WebView/JS-bridge, deeplink/URL-scheme hijack, weak crypto/RNG, biometric/local-auth patterns, sensitive-data logging, ATS detail (NSAllowsArbitraryLoads/ForMedia, NSMinimumTLSVersion, NSRequiresForwardSecrecy), cleartext/insecure-WebSocket, privacy/tracking (IDFA without ATT, pasteboard, screen-capture, **privacy manifest `PrivacyInfo.xcprivacy` absence + usage-description × API cross-check**), entitlements risk (disable-library-validation, app groups, shared keychain), debug/staging artifacts, **Mach-O hardening flags (PIE / hardened runtime / library validation)**, **data injection / dynamic dispatch (NSPredicate/NSExpression, KVC, NSSelectorFromString/performSelector, stringWithFormat)**.
+
+For data-injection findings (`--injection`), cross-reference the decompiled call sites in Phase 8 — the Ghidra `ExportAPICalls.java` output `injection-callers.txt` traces `NSSelectorFromString`/`performSelector`/`setValueForKeyPath`/`predicateWithFormat`/`NSPredicate`/`NSExpression`/`stringWithFormat` callers so you can confirm the string is attacker-controlled before raising severity.
 
 Each finding carries **Severity**, **Confidence**, **FP-likelihood** (Low/Medium/High), and **Evidence** (file:line). Proximity-based findings (logging-of-secrets, token-in-UserDefaults, RNG-for-token) are one-line co-occurrence matches: the line contains BOTH a trigger and a secret keyword — treat as a MEDIUM-confidence signal and review the surrounding function for multi-line cases. Absence-based findings (no `NSURLFileProtectionKey`, no screen-capture guard) are FP-likelihood=HIGH by design.
 
@@ -551,7 +561,7 @@ At the end of the workflow, deliver:
 7. **Deep binary analysis** — decompiled functions, cross-references, crypto analysis, data flow findings (Phase 8)
 8. **SDK inventory** — all third-party SDKs identified, with versions, categories, CVE matches, and risk assessment (Phase 9)
 9. **Protection assessment** — anti-tampering mechanisms, obfuscation, anti-debug, injection prevention, with protection score (Phase 10)
-10. **Vulnerability audit report** — iOS vulnerability classes (storage, WebView, deeplink, crypto, auth, logging, ATS, privacy, entitlements, debug) with severity/confidence/FP-likelihood/evidence (Phase 11)
+10. **Vulnerability audit report** — iOS vulnerability classes (storage, WebView, deeplink, crypto, auth, logging, ATS, privacy + privacy-manifest/usage-description cross-check, entitlements, debug, Mach-O hardening, data injection/dynamic dispatch) with severity/confidence/FP-likelihood/evidence (Phase 11)
 
 Use `--report report.md` on find-api-calls.sh, deep-secret-scan.sh, detect-sdks.sh, and detect-protections.sh to generate structured Markdown reports automatically.
 
@@ -565,4 +575,4 @@ Use `--report report.md` on find-api-calls.sh, deep-secret-scan.sh, detect-sdks.
 - `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/reversing-tools-guide.md` — CLI reversing tools reference (radare2, rizin, Ghidra headless)
 - `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/sdk-fingerprinting.md` — SDK fingerprint database, class prefixes, version extraction, and CVE reference
 - `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/anti-tampering-patterns.md` — Anti-tampering, obfuscation, anti-debug, and injection prevention patterns
-- `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/vulnerability-patterns.md` — iOS vulnerability classes (storage, WebView, deeplink, crypto, auth, logging, ATS, privacy, entitlements, debug) with FP notes and remediation
+- `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/vulnerability-patterns.md` — iOS vulnerability classes (storage, WebView, deeplink, crypto, auth, logging, ATS, privacy, entitlements, debug, data injection/dynamic dispatch) with FP notes and remediation

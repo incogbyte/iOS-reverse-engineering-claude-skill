@@ -31,9 +31,11 @@ Options:
   --auth             Biometric / local-auth only
   --logging         Sensitive-data logging only
   --network         ATS / cleartext / insecure WS only
-  --privacy         Tracking / clipboard / screen-capture only
+  --privacy         Tracking / clipboard / screen-capture / privacy manifest only
   --entitlements    Entitlements risk only
   --debug           Debug / staging artifacts only
+  --hardening       Mach-O hardening flags (PIE / hardened runtime) only
+  --injection       Data injection / dynamic dispatch only
   --all             Audit all categories (default)
   --severity LEVEL  Minimum severity: critical, high, medium, low, info (default: low)
   --report FILE     Export results as structured Markdown report
@@ -59,6 +61,8 @@ DO_NETWORK=false
 DO_PRIVACY=false
 DO_ENTITLEMENTS=false
 DO_DEBUG=false
+DO_HARDENING=false
+DO_INJECTION=false
 DO_ALL=true
 MIN_SEVERITY="low"
 REPORT_FILE=""
@@ -75,6 +79,8 @@ while [[ $# -gt 0 ]]; do
     --privacy)      DO_PRIVACY=true;     DO_ALL=false; shift ;;
     --entitlements) DO_ENTITLEMENTS=true; DO_ALL=false; shift ;;
     --debug)        DO_DEBUG=true;        DO_ALL=false; shift ;;
+    --hardening)    DO_HARDENING=true;    DO_ALL=false; shift ;;
+    --injection)    DO_INJECTION=true;    DO_ALL=false; shift ;;
     --all)          DO_ALL=true; shift ;;
     --severity)     MIN_SEVERITY="$2"; shift 2 ;;
     --report)       REPORT_FILE="$2"; shift 2 ;;
@@ -148,16 +154,11 @@ proximity() {
     | grep -iE "$keyword" 2>/dev/null | sort -u | head -25 || true
 }
 
-# plist_bool: read a boolean-ish key from Info.plist. Echoes "true"/"false"/"" (empty=absent).
-plist_val() {
-  local key="$1" plist="${2:-$ANALYSIS_DIR/Info.plist}"
-  [[ -f "$plist" ]] || { echo ""; return; }
-  if command -v plutil >/dev/null 2>&1; then
-    plutil -extract "$key" raw "$plist" 2>/dev/null || true
-  elif command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
-    /usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null || true
-  fi
-}
+# Portable plist readers (plutil -> PlistBuddy -> python3 plistlib -> plistutil).
+# Provides plist_val <key> [plist] (dotted nested keys) and plist_json [plist].
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/plist.sh
+source "$SCRIPT_DIR/lib/plist.sh"
 
 echo "=== iOS Vulnerability Audit: $ANALYSIS_DIR ==="
 echo "Minimum severity: $MIN_SEVERITY (rank $MIN_RANK)"
@@ -254,9 +255,10 @@ fi
 if [[ "$DO_ALL" == true || "$DO_DEEPLINK" == true ]]; then
   echo "--- Deeplink / URL-scheme ---"
 
-  # List custom URL schemes from Info.plist (robust: convert whole plist to JSON, grep schemes)
-  if [[ -f "$ANALYSIS_DIR/Info.plist" ]] && command -v plutil >/dev/null 2>&1; then
-    schemes=$(plutil -convert json -o - "$ANALYSIS_DIR/Info.plist" 2>/dev/null \
+  # List custom URL schemes from Info.plist (portable: plist_json from lib/plist.sh works
+  # on macOS and Linux via plutil / python3 / plistutil)
+  if [[ -f "$ANALYSIS_DIR/Info.plist" ]]; then
+    schemes=$(plist_json "$ANALYSIS_DIR/Info.plist" \
               | grep -oE '"CFBundleURLSchemes"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
               | grep -oE '"[^"]+"' | grep -vE 'CFBundleURLSchemes' | sort -u || true)
   fi
@@ -422,6 +424,62 @@ if [[ "$DO_ALL" == true || "$DO_PRIVACY" == true ]]; then
       "(absence-based, low confidence)"
   fi
 
+  # --- Apple privacy manifest (PrivacyInfo.xcprivacy) ---
+  PRIVACY_MANIFEST="$ANALYSIS_DIR/PrivacyInfo.xcprivacy"
+  if [[ ! -f "$PRIVACY_MANIFEST" ]]; then
+    # Also check the copied-plists dir as a fallback
+    if [[ -f "$ANALYSIS_DIR/plists/PrivacyInfo_xcprivacy" ]]; then
+      PRIVACY_MANIFEST="$ANALYSIS_DIR/plists/PrivacyInfo_xcprivacy"
+    fi
+  fi
+  if [[ -f "$PRIVACY_MANIFEST" ]]; then
+    declared=$(grep -oiE 'NSPrivacyAccessedAPIType[a-zA-Z]*' "$PRIVACY_MANIFEST" 2>/dev/null | sort -u | tr '\n' ' ')
+    if [[ -n "$declared" ]]; then
+      add_finding "Privacy" "info" "high" "low" \
+        "Privacy manifest declares required-reason API(s) — confirm declared reasons match actual usage" \
+        "$declared"
+    fi
+  else
+    add_finding "Privacy" "medium" "medium" "medium" \
+      "No PrivacyInfo.xcprivacy — Apple requires it for apps/SDKs using required-reason APIs (App Store submission risk)" \
+      "(absence-based — only required for some apps)"
+  fi
+
+  # --- Usage-description × API cross-check ---
+  # If the app uses a protected API symbol but Info.plist lacks the matching NSXxxUsageDescription,
+  # the app will crash on access and its privacy posture is unclear. Hard signal (FP-likelihood LOW).
+  INFO_PLIST="$ANALYSIS_DIR/Info.plist"
+  cross_pairs() {
+    # Each line: "api_regex<TAB>usage_key1|usage_key2"
+    cat <<'PAIRS'
+AVCaptureDevice|UIImagePickerController|AVCaptureSession	NSCameraUsageDescription
+AVAudioRecorder|AVCaptureSession	NSMicrophoneUsageDescription
+CLLocationManager	NSLocationWhenInUseUsageDescription|NSLocationAlwaysUsageDescription
+CNContactStore	NSContactsUsageDescription
+PHPhotoLibrary|PHAsset	NSPhotoLibraryUsageDescription
+HKHealthStore|HealthKit	NSHealthShareUsageDescription|NSHealthUpdateUsageDescription
+CBCentralManager|CBPeripheralManager	NSBluetoothAlwaysUsageDescription
+NWBrowser|NetService|Bonjour	NSLocalNetworkUsageDescription
+PAIRS
+  }
+  while IFS=$'\t' read -r api_re keys; do
+    [[ -n "$api_re" && -n "$keys" ]] || continue
+    api_hit=$(match -i "$api_re")
+    [[ -n "$api_hit" ]] || continue
+    # check any of the alternative usage keys is present and non-empty
+    found_desc=""
+    IFS='|' read -ra key_arr <<<"$keys"
+    for k in "${key_arr[@]}"; do
+      v=$(plist_val "$k" "$INFO_PLIST")
+      if [[ -n "$v" ]]; then found_desc="$k"; break; fi
+    done
+    if [[ -z "$found_desc" ]]; then
+      add_finding "Privacy" "high" "medium" "low" \
+        "Uses $api_re but Info.plist has no $keys — app will crash on access and privacy posture is unclear" \
+        "$api_hit"
+    fi
+  done < <(cross_pairs)
+
   echo
 fi
 
@@ -477,6 +535,93 @@ if [[ "$DO_ALL" == true || "$DO_DEBUG" == true ]]; then
   res=$(match -i 'isTestflight|isBeta|isDebugMode')
   [[ -n "$res" ]] && add_finding "Debug" "info" "low" "low" \
     "Beta/testflight flag — review if it gates security controls" "$res"
+
+  echo
+fi
+
+# =====================================================================
+# 11. Mach-O hardening flags (PIE / hardened runtime / library validation)
+# =====================================================================
+if [[ "$DO_ALL" == true || "$DO_HARDENING" == true ]]; then
+  echo "--- Mach-O Hardening ---"
+
+  FLAGS_FILE="$ANALYSIS_DIR/macho-flags.txt"
+  if [[ -f "$FLAGS_FILE" ]]; then
+    flags_line=$(grep -iE '^Flags' "$FLAGS_FILE" 2>/dev/null | head -1 || true)
+    type_line=$(grep -iE '^Type' "$FLAGS_FILE" 2>/dev/null | head -1 || true)
+    # "executable" if otool filetype is EXECUTE, or ipsw flags line contains MH_EXECUTE.
+    is_exec=false
+    { [[ -n "$type_line" ]] && echo "$type_line" | grep -qi 'EXECUTE'; } && is_exec=true
+    { [[ -n "$flags_line" ]] && echo "$flags_line" | grep -qi 'MH_EXECUTE'; } && is_exec=true
+    # An executable that is not PIE defeats ASLR (easier ROP / code reuse).
+    if [[ "$is_exec" == true ]] && ! echo "$flags_line" | grep -qw 'PIE'; then
+      add_finding "Hardening" "medium" "high" "low" \
+        "Binary is an executable but NOT PIE — defeats ASLR, eases ROP/code-reuse" \
+        "$flags_line"
+    fi
+    # MH_NO_HEAP_EXECUTION / no-writeable-heap absence is a weaker signal (note only).
+    if [[ "$is_exec" == true ]] \
+       && ! echo "$flags_line" | grep -qiE 'NoHeapExec|No_PIE|MH_NO_HEAP_EXECUTION'; then
+      add_finding "Hardening" "low" "low" "medium" \
+        "No MH_NO_HEAP_EXECUTION flag — heap may be executable (W^X not enforced)" \
+        "$flags_line (absence-based — only meaningful for macOS-distributed apps)"
+    fi
+  else
+    add_finding "Hardening" "info" "low" "high" \
+      "No macho-flags.txt — Mach-O header flags not captured (run extract-ipa.sh with otool or ipsw)" \
+      "(absence-based)"
+  fi
+
+  # Hardened-runtime weakening via entitlements (cross-link with Entitlements category).
+  ENT="$ANALYSIS_DIR/entitlements.plist"
+  if [[ -f "$ENT" ]]; then
+    weak=0
+    for e in "com.apple.security.cs.disable-library-validation" \
+             "com.apple.security.cs.allow-dyld-environment-variables" \
+             "com.apple.security.cs.allow-jit"; do
+      grep -q "$e" "$ENT" 2>/dev/null && weak=$((weak + 1))
+    done
+    if [[ "$weak" -ge 2 ]]; then
+      add_finding "Hardening" "medium" "medium" "low" \
+        "Hardened runtime broadly weakened ($weak cs.* relaxations set) — widens attack surface" \
+        "entitlements.plist (absence-based — only meaningful for macOS-distributed apps)"
+    fi
+  fi
+
+  echo
+fi
+
+# =====================================================================
+# 12. Data injection / dynamic dispatch
+# =====================================================================
+if [[ "$DO_ALL" == true || "$DO_INJECTION" == true ]]; then
+  echo "--- Data Injection / Dynamic Dispatch ---"
+
+  # NSPredicate / NSExpression format string built from user input -> predicate/expression injection
+  res=$(proximity -i 'NSPredicate|predicateWithFormat|NSExpression|expressionWithFormat|expressionForFormat' \
+                  'format.*%@|stringByAppending|\+.*string|stringWithFormat')
+  [[ -n "$res" ]] && add_finding "Injection" "high" "medium" "medium" \
+    "NSPredicate/NSExpression format string possibly built from user input — predicate/expression injection (arbitrary predicate, @selector invocation, data exfiltration)" \
+    "$res"
+
+  # KVC setValue:forKeyPath: on possibly user-controlled input
+  res=$(proximity -i 'setValue:forKeyPath:|setValue\(|setValueForKeyPath|valueForKeyPath' \
+                  'user|input|param|request|query|field|form')
+  [[ -n "$res" ]] && add_finding "Injection" "medium" "medium" "medium" \
+    "KVC setValue:forKeyPath on possibly user-controlled input — can set unintended properties (e.g. isAdmin)" \
+    "$res"
+
+  # Dynamic selector/classes from strings — arbitrary method invocation if attacker-influenced
+  res=$(match 'NSSelectorFromString|NSClassFromString|performSelector|class_addSelector')
+  [[ -n "$res" ]] && add_finding "Injection" "medium" "medium" "medium" \
+    "Dynamic selector/class from string — potential arbitrary method invocation if the string is attacker-influenced" \
+    "$res"
+
+  # Legacy ObjC format-string info leak/crash with user data
+  res=$(proximity -i 'stringWithFormat|NSString.*stringWithFormat' '%@|%d|%s|user|input|param')
+  [[ -n "$res" ]] && add_finding "Injection" "low" "low" "medium" \
+    "stringWithFormat with user data — possible format-string info leak/crash (legacy ObjC)" \
+    "$res"
 
   echo
 fi
@@ -539,13 +684,13 @@ if [[ -n "$REPORT_FILE" ]]; then
     echo "Order of operations:"
     echo "1. Triage by **FP-likelihood** first — High-FP findings (absence-based, permissive-pattern, multi-line proximity) need manual confirmation before action."
     echo "2. Then by **Severity × Confidence**: critical/high + high-confidence = act now; medium = investigate."
-    echo "3. For each finding, map the evidence (`file:line:match`) back to the decompiled/class-dumped code (Phase 8) to confirm exploitability."
+    echo "3. For each finding, map the evidence (\`file:line:match\`) back to the decompiled/class-dumped code (Phase 8) to confirm exploitability."
     echo "4. **Proximity findings** (logging-of-secrets, token-in-UserDefaults, RNG-for-token) are one-line co-occurrence matches — review the surrounding function for multi-line cases the pattern missed."
-    echo "5. Cross-reference with `deep-secret-scan.sh` (Phase 7) for the actual credential values, and `detect-protections.sh` (Phase 10) for whether anti-tampering would block dynamic confirmation."
+    echo "5. Cross-reference with \`deep-secret-scan.sh\` (Phase 7) for the actual credential values, and \`detect-protections.sh\` (Phase 10) for whether anti-tampering would block dynamic confirmation."
     echo
     echo "### FP-likelihood legend"
-    echo "- **Low**: direct API/flag match, high signal (e.g. `UIFileSharingEnabled=true`, ECB mode)."
-    echo "- **Medium**: requires contextual confirmation (e.g. `evaluateJavaScript` present, JS-bridge intent unclear)."
+    echo "- **Low**: direct API/flag match, high signal (e.g. \`UIFileSharingEnabled=true\`, ECB mode)."
+    echo "- **Medium**: requires contextual confirmation (e.g. \`evaluateJavaScript\` present, JS-bridge intent unclear)."
     echo "- **High**: absence-based or permissive proximity; likely real but needs human review."
     echo
     echo "---"

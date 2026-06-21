@@ -37,6 +37,22 @@ public class ExportAPICalls extends GhidraScript {
         "connect", "send", "recv", "socket", "getaddrinfo",
     };
 
+    // Data-injection / dynamic-dispatch symbols (cross-references audit-vulnerabilities.sh --injection).
+    // Traced the same way as NETWORK_SYMBOLS and written to injection-callers.txt so the LLM can
+    // cross-reference data-injection findings against decompiled call sites in Phase 8.
+    private static final String[] INJECTION_SYMBOLS = {
+        // Dynamic dispatch from string
+        "NSSelectorFromString", "NSClassFromString", "performSelector", "performSelector:",
+        "class_addSelector", "respondsToSelector",
+        // KVC
+        "setValueForKeyPath", "setValue:forKeyPath:", "valueForKeyPath", "valueForKey",
+        // Predicate / expression format-string injection
+        "predicateWithFormat", "NSPredicate", "NSExpression", "expressionWithFormat",
+        "expressionForFormat", "evaluateWithObject",
+        // Format-string info leak
+        "stringWithFormat",
+    };
+
     private static final Pattern URL_PATTERN = Pattern.compile(
         "https?://[a-zA-Z0-9._/\\-?&=#+%:@]+|wss?://[a-zA-Z0-9._/\\-?&=#+%:@]+"
     );
@@ -61,33 +77,13 @@ public class ExportAPICalls extends GhidraScript {
 
         SymbolTable symbolTable = currentProgram.getSymbolTable();
         Map<String, List<String>> apiCallers = new LinkedHashMap<>();
+        Map<String, List<String>> injectionCallers = new LinkedHashMap<>();
         Set<String> discoveredURLs = new TreeSet<>();
         Set<String> discoveredEndpoints = new TreeSet<>();
 
-        // Phase 1: Find network-related symbols and their cross-references
-        println("Phase 1: Finding network API symbols and callers...");
-        for (String symName : NETWORK_SYMBOLS) {
-            SymbolIterator symbols = symbolTable.getSymbols(symName);
-            while (symbols.hasNext()) {
-                Symbol sym = symbols.next();
-                List<String> callers = new ArrayList<>();
-
-                ReferenceIterator refs = currentProgram.getReferenceManager()
-                    .getReferencesTo(sym.getAddress());
-                while (refs.hasNext()) {
-                    Reference ref = refs.next();
-                    Function caller = currentProgram.getFunctionManager()
-                        .getFunctionContaining(ref.getFromAddress());
-                    if (caller != null) {
-                        callers.add(caller.getName() + " @ " + ref.getFromAddress());
-                    }
-                }
-
-                if (!callers.isEmpty()) {
-                    apiCallers.put(symName + " @ " + sym.getAddress(), callers);
-                }
-            }
-        }
+        // Phase 1a: Find network-related symbols and their cross-references
+        println("Phase 1a: Finding network API symbols and callers...");
+        traceSymbols(symbolTable, NETWORK_SYMBOLS, apiCallers);
 
         // Also search for symbols containing network-related keywords
         SymbolIterator allSymbols = symbolTable.getAllSymbols(true);
@@ -118,6 +114,11 @@ public class ExportAPICalls extends GhidraScript {
         }
 
         println("  Found " + apiCallers.size() + " network-related symbols with callers");
+
+        // Phase 1b: Find data-injection / dynamic-dispatch symbols and their cross-references
+        println("Phase 1b: Finding data-injection / dynamic-dispatch symbols and callers...");
+        traceSymbols(symbolTable, INJECTION_SYMBOLS, injectionCallers);
+        println("  Found " + injectionCallers.size() + " injection-related symbols with callers");
 
         // Phase 2: Extract URLs from decompiled code
         println("Phase 2: Extracting URLs from decompiled functions...");
@@ -183,7 +184,52 @@ public class ExportAPICalls extends GhidraScript {
         }
         urlsWriter.close();
 
+        // Write injection-callers report (cross-references audit-vulnerabilities.sh --injection)
+        File injectionFile = new File(outDir, "injection-callers.txt");
+        PrintWriter injectionWriter = new PrintWriter(new FileWriter(injectionFile));
+        injectionWriter.println("=== Data Injection / Dynamic Dispatch Call Analysis ===");
+        injectionWriter.println("Binary: " + currentProgram.getName());
+        injectionWriter.println();
+        if (injectionCallers.isEmpty()) {
+            injectionWriter.println("(no dynamic-dispatch / KVC / predicate symbols found with callers)");
+        } else {
+            for (Map.Entry<String, List<String>> entry : injectionCallers.entrySet()) {
+                injectionWriter.println("--- " + entry.getKey() + " ---");
+                injectionWriter.println("Called by:");
+                for (String caller : entry.getValue()) {
+                    injectionWriter.println("  " + caller);
+                }
+                injectionWriter.println();
+            }
+        }
+        injectionWriter.close();
+
         println("API call analysis complete.");
         println("Reports: " + outDir.getAbsolutePath());
+    }
+
+    // Trace a set of named symbols, populating <target> with "symbol @ addr" -> list of callers.
+    private void traceSymbols(SymbolTable symbolTable, String[] names,
+                              Map<String, List<String>> target) {
+        for (String symName : names) {
+            SymbolIterator symbols = symbolTable.getSymbols(symName);
+            while (symbols.hasNext()) {
+                Symbol sym = symbols.next();
+                List<String> callers = new ArrayList<>();
+                ReferenceIterator refs = currentProgram.getReferenceManager()
+                    .getReferencesTo(sym.getAddress());
+                while (refs.hasNext()) {
+                    Reference ref = refs.next();
+                    Function caller = currentProgram.getFunctionManager()
+                        .getFunctionContaining(ref.getFromAddress());
+                    if (caller != null) {
+                        callers.add(caller.getName() + " @ " + ref.getFromAddress());
+                    }
+                }
+                if (!callers.isEmpty()) {
+                    target.put(symName + " @ " + sym.getAddress(), callers);
+                }
+            }
+        }
     }
 }

@@ -144,6 +144,32 @@ search_linked_libs() {
   fi
 }
 
+# macho_load_commands <binary> -> echo raw Mach-O load commands for direct-binary analysis.
+# macOS: otool -l. Linux/cross fallback: ipsw macho info -l (on a single-arch binary).
+# ipsw launches an interactive TUI on fat binaries, so we thin to the first arch first.
+_macho_info_arch_arg() {
+  local binary="$1"
+  if ! file "$binary" 2>/dev/null | grep -qi 'universal\|fat'; then echo ""; return; fi
+  local arch
+  arch=$(file "$binary" 2>/dev/null | grep -oE '\[[a-z0-9_]+:' | head -1 | tr -d '[]:')
+  if [[ -n "$arch" ]]; then echo "--arch $arch"; else echo "--arch arm64"; fi
+}
+
+macho_load_commands() {
+  local binary="$1"
+  [[ -n "$binary" && -f "$binary" ]] || return 0
+  if command -v otool &>/dev/null; then
+    otool -l "$binary" 2>/dev/null || true
+    return
+  fi
+  if command -v ipsw &>/dev/null; then
+    local archarg; archarg=$(_macho_info_arch_arg "$binary")
+    ipsw macho info --no-color $archarg -l "$binary" 2>/dev/null || true
+    return
+  fi
+  return 0
+}
+
 echo "=== iOS Protection & Anti-Tampering Detection ==="
 echo "Analysis directory: $ANALYSIS_DIR"
 echo
@@ -378,9 +404,9 @@ if [[ "$DO_ALL" == true ]] || [[ "$DO_INJECTION" == true ]]; then
     fi
   fi
 
-  # Also check via otool on the binary directly
-  if [[ -n "$BINARY_FILE" ]] && [[ -f "$BINARY_FILE" ]] && command -v otool &>/dev/null; then
-    restrict=$(otool -l "$BINARY_FILE" 2>/dev/null | grep -A2 "__RESTRICT" || true)
+  # Also check via otool/ipsw on the binary directly (otool macOS, ipsw cross-platform fallback)
+  if [[ -n "$BINARY_FILE" ]] && [[ -f "$BINARY_FILE" ]]; then
+    restrict=$(macho_load_commands "$BINARY_FILE" | grep -A2 "__RESTRICT" || true)
     if [[ -n "$restrict" ]]; then
       add_finding "Injection" "INFO" "HIGH" "__RESTRICT segment confirmed in Mach-O binary" "Binary has __RESTRICT,__restrict section"
     fi
@@ -553,9 +579,9 @@ if [[ "$DO_ALL" == true ]] || [[ "$DO_ENCRYPTION" == true ]]; then
     fi
   fi
 
-  # Check directly on binary
-  if [[ -n "$BINARY_FILE" ]] && [[ -f "$BINARY_FILE" ]] && command -v otool &>/dev/null; then
-    crypt_info=$(otool -l "$BINARY_FILE" 2>/dev/null | grep -A4 "LC_ENCRYPTION_INFO" || true)
+  # Check directly on binary (otool macOS, ipsw cross-platform fallback)
+  if [[ -n "$BINARY_FILE" ]] && [[ -f "$BINARY_FILE" ]]; then
+    crypt_info=$(macho_load_commands "$BINARY_FILE" | grep -A4 "LC_ENCRYPTION_INFO" || true)
     if [[ -n "$crypt_info" ]]; then
       cryptid=$(echo "$crypt_info" | grep "cryptid" | awk '{print $2}' || echo "")
       if [[ "$cryptid" == "1" ]]; then
@@ -575,16 +601,14 @@ echo "=== Protection Detection Summary ==="
 echo "Total findings: ${#FINDINGS[@]}"
 echo
 
-# Count by type
-declare -A TYPE_COUNTS
-for t in "${FINDING_TYPES[@]}"; do
-  TYPE_COUNTS["$t"]=$(( ${TYPE_COUNTS["$t"]:-0} + 1 ))
-done
-
+# Count by type (portable: no associative arrays, for bash 3.2 on macOS)
 echo "By type:"
-for t in $(echo "${!TYPE_COUNTS[@]}" | tr ' ' '\n' | sort); do
-  printf "  %-20s %d\n" "$t" "${TYPE_COUNTS[$t]}"
-done
+if [[ ${#FINDING_TYPES[@]} -gt 0 ]]; then
+  while IFS= read -r t; do
+    c=$(printf '%s\n' "${FINDING_TYPES[@]}" | grep -cxF "$t")
+    printf "  %-20s %d\n" "$t" "$c"
+  done < <(printf '%s\n' "${FINDING_TYPES[@]}" | sort -u)
+fi
 echo
 
 # Protection score

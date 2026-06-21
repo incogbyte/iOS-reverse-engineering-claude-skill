@@ -16,7 +16,8 @@ Install a dependency required for iOS reverse engineering.
 
 Available dependencies:
   ipsw              ipsw toolkit (includes class-dump, dyld cache analysis, and more)
-  xcode-cli-tools   Xcode Command Line Tools (otool, strings, codesign, lipo, nm)
+  xcode-cli-tools   Xcode Command Line Tools (otool, strings, codesign, lipo, nm) — macOS
+  libplist          libplist / plistutil (cross-platform plist reader, Linux alternative to plutil)
   jtool2            jtool2 Mach-O analyzer
   frida             Frida dynamic instrumentation toolkit
   libimobiledevice  Tools for iOS device interaction
@@ -245,18 +246,43 @@ install_xcode_cli_tools() {
     echo "Please complete the installation dialog and re-run the dependency check."
     exit 0
   else
-    # Linux: install binutils for strings, and llvm for otool equivalent
-    info "Installing binutils (provides strings) on Linux..."
+    # Linux: install binutils (strings/nm) and libplist (plistutil) for cross-platform analysis.
+    # otool/codesign/lipo/plutil are macOS-only; the scripts fall back to `ipsw macho info` for
+    # Mach-O analysis and to python3 plistlib / plistutil for plists.
+    info "Installing binutils (provides strings/nm) on Linux..."
     case "$PKG_MANAGER" in
       apt)     pkg_install "binutils" ;;
       dnf)     pkg_install "binutils" ;;
       pacman)  pkg_install "binutils" ;;
       brew)    pkg_install "binutils" ;;
-      *)       manual "Install binutils for 'strings' command" ;;
+      *)       manual "Install binutils for 'strings'/'nm' commands" ;;
     esac
     ok "binutils installed"
-    info "Note: otool is macOS-only. Use 'objdump' or 'rabin2' as alternatives on Linux."
+    info "Installing libplist (provides plistutil) on Linux..."
+    install_libplist
+    info "Note: otool/codesign/lipo/plutil are macOS-only. The scripts use 'ipsw macho info' for Mach-O analysis and python3/plistutil for plists on Linux."
   fi
+}
+
+install_libplist() {
+  if command -v plistutil &>/dev/null; then
+    ok "libplist (plistutil) already installed"
+    return 0
+  fi
+  # python3 plistlib is an acceptable cross-platform alternative (lib/plist.sh falls back to it).
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import plistlib' 2>/dev/null; then
+    ok "python3 plistlib available (plist reader present — libplist optional)"
+    return 0
+  fi
+
+  case "$PKG_MANAGER" in
+    apt)     pkg_install "libplist-utils" ;;   # Debian: plistutil is in libplist-utils
+    dnf)     pkg_install "libplist" ;;
+    pacman)  pkg_install "libplist" ;;
+    brew)    pkg_install "libplist" ;;
+    *)       manual "Install libplist (provides 'plistutil') or python3" ;;
+  esac
+  ok "libplist installed"
 }
 
 install_jtool2() {
@@ -410,6 +436,7 @@ install_ghidra() {
 case "$DEP" in
   ipsw)                   install_ipsw ;;
   xcode-cli-tools|xcode)  install_xcode_cli_tools ;;
+  libplist|plistutil)     install_libplist ;;
   jtool2|jtool)           install_jtool2 ;;
   frida)                  install_frida ;;
   libimobiledevice)       install_libimobiledevice ;;
@@ -419,7 +446,7 @@ case "$DEP" in
   ghidra)                 install_ghidra ;;
   *)
     echo "Error: Unknown dependency '$DEP'" >&2
-    echo "Available: ipsw, xcode-cli-tools, jtool2, frida, libimobiledevice, swift-demangle, radare2, rizin, ghidra" >&2
+    echo "Available: ipsw, xcode-cli-tools, libplist, jtool2, frida, libimobiledevice, swift-demangle, radare2, rizin, ghidra" >&2
     exit 1
     ;;
 esac
