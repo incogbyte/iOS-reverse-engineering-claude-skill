@@ -529,11 +529,17 @@ bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerab
 # Data injection / dynamic dispatch (NSPredicate/NSExpression format strings, KVC, NSSelectorFromString/performSelector, stringWithFormat)
 bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --injection
 
+# Insecure deserialization (NSKeyedUnarchiver unsafe APIs, decodeObject(forKey:) without NSSecureCoding)
+bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --deserialization
+
+# Unsafe parsing / archive handling (XXE via NSXMLParser/libxml2, Zip Slip via archive libs)
+bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --parsing
+
 # Only high/critical findings
 bash ${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/scripts/audit-vulnerabilities.sh <output>/ --all --severity high --report vuln-report.md
 ```
 
-**Categories detected**: insecure local storage, WebView/JS-bridge, deeplink/URL-scheme hijack, weak crypto/RNG, biometric/local-auth patterns, sensitive-data logging, ATS detail (NSAllowsArbitraryLoads/ForMedia, NSMinimumTLSVersion, NSRequiresForwardSecrecy), cleartext/insecure-WebSocket, privacy/tracking (IDFA without ATT, pasteboard, screen-capture, **privacy manifest `PrivacyInfo.xcprivacy` absence + usage-description × API cross-check**), entitlements risk (disable-library-validation, app groups, shared keychain), debug/staging artifacts, **Mach-O hardening flags (PIE / hardened runtime / library validation)**, **data injection / dynamic dispatch (NSPredicate/NSExpression, KVC, NSSelectorFromString/performSelector, stringWithFormat)**.
+**Categories detected**: insecure local storage (**including backup-exclusion absence and App-Group `UserDefaults` secret exposure**), WebView/JS-bridge, deeplink/URL-scheme hijack, weak crypto/RNG, biometric/local-auth patterns (**including Sign in with Apple nonce absence**), sensitive-data logging, ATS detail (NSAllowsArbitraryLoads/ForMedia, NSMinimumTLSVersion, NSRequiresForwardSecrecy), cleartext/insecure-WebSocket, **third-party certificate-pinning misconfiguration (AFNetworking/TrustKit/Alamofire) and permanently-persisted URL credentials**, privacy/tracking (IDFA without ATT, pasteboard, screen-capture, **app-switcher/background-snapshot leak, `LSApplicationQueriesSchemes` fingerprinting**, privacy manifest `PrivacyInfo.xcprivacy` absence + usage-description × API cross-check), entitlements risk (disable-library-validation, app groups, shared keychain), debug/staging artifacts, Mach-O hardening flags (PIE / hardened runtime / library validation), data injection / dynamic dispatch (NSPredicate/NSExpression, KVC, NSSelectorFromString/performSelector, stringWithFormat), **insecure deserialization (NSKeyedUnarchiver unsafe APIs, missing NSSecureCoding)**, **unsafe parsing / archive handling (XXE via NSXMLParser/libxml2, Zip Slip via archive-extraction libraries)**.
 
 For data-injection findings (`--injection`), cross-reference the decompiled call sites in Phase 8 — the Ghidra `ExportAPICalls.java` output `injection-callers.txt` traces `NSSelectorFromString`/`performSelector`/`setValueForKeyPath`/`predicateWithFormat`/`NSPredicate`/`NSExpression`/`stringWithFormat` callers so you can confirm the string is attacker-controlled before raising severity.
 
@@ -561,7 +567,7 @@ At the end of the workflow, deliver:
 7. **Deep binary analysis** — decompiled functions, cross-references, crypto analysis, data flow findings (Phase 8)
 8. **SDK inventory** — all third-party SDKs identified, with versions, categories, CVE matches, and risk assessment (Phase 9)
 9. **Protection assessment** — anti-tampering mechanisms, obfuscation, anti-debug, injection prevention, with protection score (Phase 10)
-10. **Vulnerability audit report** — iOS vulnerability classes (storage, WebView, deeplink, crypto, auth, logging, ATS, privacy + privacy-manifest/usage-description cross-check, entitlements, debug, Mach-O hardening, data injection/dynamic dispatch) with severity/confidence/FP-likelihood/evidence (Phase 11)
+10. **Vulnerability audit report** — iOS vulnerability classes (storage + backup-exclusion + App-Group UserDefaults, WebView, deeplink, crypto, auth + Sign-in-with-Apple nonce, logging, ATS + cert-pinning misconfiguration + persisted credentials, privacy + privacy-manifest/usage-description cross-check + background-snapshot + LSApplicationQueriesSchemes, entitlements, debug, Mach-O hardening, data injection/dynamic dispatch, insecure deserialization, unsafe parsing/archive handling) with severity/confidence/FP-likelihood/evidence (Phase 11)
 
 Use `--report report.md` on find-api-calls.sh, deep-secret-scan.sh, detect-sdks.sh, and detect-protections.sh to generate structured Markdown reports automatically.
 
@@ -575,4 +581,4 @@ Use `--report report.md` on find-api-calls.sh, deep-secret-scan.sh, detect-sdks.
 - `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/reversing-tools-guide.md` — CLI reversing tools reference (radare2, rizin, Ghidra headless)
 - `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/sdk-fingerprinting.md` — SDK fingerprint database, class prefixes, version extraction, and CVE reference
 - `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/anti-tampering-patterns.md` — Anti-tampering, obfuscation, anti-debug, and injection prevention patterns
-- `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/vulnerability-patterns.md` — iOS vulnerability classes (storage, WebView, deeplink, crypto, auth, logging, ATS, privacy, entitlements, debug, data injection/dynamic dispatch) with FP notes and remediation
+- `${CLAUDE_PLUGIN_ROOT}/skills/ios-reverse-engineering/references/vulnerability-patterns.md` — iOS vulnerability classes (storage, WebView, deeplink, crypto, auth, logging, ATS, privacy, entitlements, debug, Mach-O hardening, data injection/dynamic dispatch, insecure deserialization, unsafe parsing/archive handling) with FP notes and remediation

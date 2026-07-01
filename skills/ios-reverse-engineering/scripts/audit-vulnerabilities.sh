@@ -4,7 +4,9 @@
 # Complements find-api-calls.sh (API extraction) and deep-secret-scan.sh (secrets) by
 # hunting iOS-specific vulnerability CLASSES: insecure local storage, WebView/JS-bridge
 # abuse, deeplink/URL-scheme hijack, weak crypto/RNG, biometric-bypass patterns, sensitive
-# logging, ATS detail, privacy/tracking, entitlements risk, and debug artifacts.
+# logging, ATS detail, privacy/tracking, entitlements risk, debug artifacts, Mach-O
+# hardening, data injection/dynamic dispatch, insecure deserialization, and unsafe
+# parsing/archive handling (XXE, Zip Slip).
 #
 # Each finding carries: Category, Severity, Confidence, FP-likelihood, Evidence (file:line).
 # Proximity-based findings (logging-of-secrets, token-in-UserDefaults, RNG-for-tokens) use a
@@ -18,7 +20,8 @@ Usage: audit-vulnerabilities.sh <analysis-dir> [OPTIONS]
 
 Audit an extracted iOS app for static security vulnerabilities (insecure storage,
 WebView/JS-bridge, deeplink hijack, weak crypto, biometric bypass, sensitive logging,
-ATS detail, privacy/tracking, entitlements risk, debug artifacts).
+ATS detail, privacy/tracking, entitlements risk, debug artifacts, Mach-O hardening,
+data injection, insecure deserialization, unsafe parsing/archive handling).
 
 Arguments:
   <analysis-dir>    Path to the analysis output directory (from extract-ipa.sh)
@@ -30,12 +33,14 @@ Options:
   --crypto          Weak crypto / RNG only
   --auth             Biometric / local-auth only
   --logging         Sensitive-data logging only
-  --network         ATS / cleartext / insecure WS only
+  --network         ATS / cleartext / insecure WS / cert-pinning misconfig only
   --privacy         Tracking / clipboard / screen-capture / privacy manifest only
   --entitlements    Entitlements risk only
   --debug           Debug / staging artifacts only
   --hardening       Mach-O hardening flags (PIE / hardened runtime) only
   --injection       Data injection / dynamic dispatch only
+  --deserialization Insecure deserialization (NSKeyedUnarchiver / NSCoding) only
+  --parsing         Unsafe parsing / archive handling (XXE, Zip Slip) only
   --all             Audit all categories (default)
   --severity LEVEL  Minimum severity: critical, high, medium, low, info (default: low)
   --report FILE     Export results as structured Markdown report
@@ -63,6 +68,8 @@ DO_ENTITLEMENTS=false
 DO_DEBUG=false
 DO_HARDENING=false
 DO_INJECTION=false
+DO_DESERIALIZATION=false
+DO_PARSING=false
 DO_ALL=true
 MIN_SEVERITY="low"
 REPORT_FILE=""
@@ -81,6 +88,8 @@ while [[ $# -gt 0 ]]; do
     --debug)        DO_DEBUG=true;        DO_ALL=false; shift ;;
     --hardening)    DO_HARDENING=true;    DO_ALL=false; shift ;;
     --injection)    DO_INJECTION=true;    DO_ALL=false; shift ;;
+    --deserialization) DO_DESERIALIZATION=true; DO_ALL=false; shift ;;
+    --parsing)      DO_PARSING=true;      DO_ALL=false; shift ;;
     --all)          DO_ALL=true; shift ;;
     --severity)     MIN_SEVERITY="$2"; shift 2 ;;
     --report)       REPORT_FILE="$2"; shift 2 ;;
@@ -213,6 +222,22 @@ if [[ "$DO_ALL" == true || "$DO_STORAGE" == true ]]; then
       "(absence-based — confirm app stores sensitive data)"
   fi
 
+  # Backup-exclusion absence: sensitive-looking file writes with no isExcludedFromBackup usage anywhere
+  has_backup_exclusion=$(match -i 'isExcludedFromBackup|NSURLIsExcludedFromBackupKey|addSkipBackupAttributeToItemAtURL')
+  filewrite_sensitive=$(proximity -i 'FileManager|NSFileManager|\.write\(to:|writeToFile|NSData.*write' \
+                          'token|password|secret|credential|jwt|bearer|apikey|api_key|private[_-]?key')
+  if [[ -z "$has_backup_exclusion" && -n "$filewrite_sensitive" ]]; then
+    add_finding "Storage" "low" "low" "high" \
+      "No isExcludedFromBackup/NSURLIsExcludedFromBackupKey usage found, but sensitive-looking file writes are present — sensitive files may be included in iTunes/iCloud backups" \
+      "$filewrite_sensitive"
+  fi
+
+  # App-Group UserDefaults holding secrets — worse exposure than plain UserDefaults: readable by
+  # every process sharing the group (extensions, widgets), not just the main app.
+  res=$(proximity -i 'UserDefaults\(suiteName:|suiteName' 'token|password|secret|credential|jwt|bearer|auth_token|apikey|api_key')
+  [[ -n "$res" ]] && add_finding "Storage" "medium" "medium" "medium" \
+    "Sensitive value written to App-Group (suiteName) UserDefaults — readable by every process sharing the app group" "$res"
+
   echo
 fi
 
@@ -330,6 +355,15 @@ if [[ "$DO_ALL" == true || "$DO_AUTH" == true ]]; then
   [[ -n "$res" ]] && add_finding "Auth" "medium" "low" "high" \
     "evaluatePolicy result handling looks permissive — review biometric bypass potential" "$res"
 
+  # Sign in with Apple used without any visible nonce — replay/token-substitution risk (absence-based, global)
+  has_siwa=$(match 'ASAuthorizationAppleIDRequest|ASAuthorizationAppleIDProvider')
+  has_nonce=$(match -i 'nonce')
+  if [[ -n "$has_siwa" && -z "$has_nonce" ]]; then
+    add_finding "Auth" "medium" "low" "high" \
+      "Sign in with Apple used but no nonce found anywhere in the app — identityToken may be replayable; verify server-side nonce binding" \
+      "$has_siwa"
+  fi
+
   echo
 fi
 
@@ -396,6 +430,22 @@ if [[ "$DO_ALL" == true || "$DO_NETWORK" == true ]]; then
   [[ -n "$res" ]] && add_finding "Network" "high" "medium" "medium" \
     "Custom trust manager may bypass TLS validation" "$res"
 
+  # Third-party certificate-pinning library present (baseline — distinct from misconfiguration below)
+  res=$(match 'AFSecurityPolicy|TrustKit\b|PinnedCertificatesTrustEvaluator|ServerTrustManager')
+  [[ -n "$res" ]] && add_finding "Network" "info" "medium" "low" \
+    "Third-party certificate-pinning framework detected — verify its configuration is not weakened" "$res"
+
+  # Third-party pinning misconfiguration/disablement — distinct from the generic bypass above:
+  # this flags a NAMED framework's pinning being explicitly turned off.
+  res=$(match 'allowInvalidCertificates\s*=\s*(YES|true)|validatesDomainName\s*=\s*(NO|false)|SSLPinningMode\.none|SSLPinningModeNone|validateHost\s*:\s*false|validateCertificateChain\s*:\s*false|kTSKEnforcePinning.*(NO|false)')
+  [[ -n "$res" ]] && add_finding "Network" "high" "high" "low" \
+    "Third-party certificate-pinning library explicitly misconfigured/disabled (AFNetworking/TrustKit/Alamofire)" "$res"
+
+  # Credentials persisted in the URL credential store (survives app restarts, backed up)
+  res=$(match 'NSURLCredentialPersistencePermanent|persistence\s*:\s*\.permanent')
+  [[ -n "$res" ]] && add_finding "Network" "high" "high" "low" \
+    "URLCredential stored with permanent persistence — password/credential persisted outside the Keychain" "$res"
+
   echo
 fi
 
@@ -422,6 +472,31 @@ if [[ "$DO_ALL" == true || "$DO_PRIVACY" == true ]]; then
     add_finding "Privacy" "low" "low" "high" \
       "Sensitive-app keywords present but no screen-capture detection — screen recording could leak UI" \
       "(absence-based, low confidence)"
+  fi
+
+  # App-switcher / background-snapshot guard absence for sensitive apps (distinct from screen-capture:
+  # this is the app-switcher thumbnail iOS takes on backgrounding, not screen recording)
+  has_bg_lifecycle=$(match -i 'applicationDidEnterBackground|sceneDidEnterBackground|applicationWillResignActive|sceneWillResignActive')
+  has_redaction=$(match -i 'blur|redact|privacyView|coverView|snapshotView|dimView|hideSensitiveContent')
+  if [[ -n "$has_bg_lifecycle" && -z "$has_redaction" && -n "$(match -i 'bank|wallet|payment|card|otp|pin')" ]]; then
+    add_finding "Privacy" "low" "low" "high" \
+      "Sensitive-app keywords present but no UI blur/redaction on backgrounding — app-switcher snapshot could leak UI" \
+      "(absence-based, low confidence)"
+  fi
+
+  # LSApplicationQueriesSchemes with a large scheme list — installed-app enumeration/fingerprinting
+  if [[ -f "$ANALYSIS_DIR/Info.plist" ]]; then
+    queries=$(plist_json "$ANALYSIS_DIR/Info.plist" \
+              | grep -oE '"LSApplicationQueriesSchemes"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
+              | grep -oE '"[^"]+"' | grep -vE 'LSApplicationQueriesSchemes' | sort -u || true)
+    if [[ -n "$queries" ]]; then
+      qcount=$(printf '%s\n' "$queries" | grep -c .)
+      if [[ "$qcount" -gt 10 ]]; then
+        add_finding "Privacy" "medium" "high" "low" \
+          "LSApplicationQueriesSchemes declares $qcount schemes — large query list enables installed-app enumeration/fingerprinting" \
+          "$queries"
+      fi
+    fi
   fi
 
   # --- Apple privacy manifest (PrivacyInfo.xcprivacy) ---
@@ -622,6 +697,82 @@ if [[ "$DO_ALL" == true || "$DO_INJECTION" == true ]]; then
   [[ -n "$res" ]] && add_finding "Injection" "low" "low" "medium" \
     "stringWithFormat with user data — possible format-string info leak/crash (legacy ObjC)" \
     "$res"
+
+  echo
+fi
+
+# =====================================================================
+# 13. Insecure Deserialization
+# =====================================================================
+if [[ "$DO_ALL" == true || "$DO_DESERIALIZATION" == true ]]; then
+  echo "--- Insecure Deserialization ---"
+
+  # Deprecated unarchiver APIs — no class allowlisting, arbitrary-class instantiation from
+  # attacker-controlled bytes (classic iOS gadget-chain / RCE surface).
+  res=$(match 'unarchiveObjectWithData|unarchiveObjectWithFile|unarchiveTopLevelObjectWithData|unarchiveObject\(with:|unarchiveObject\(withFile:|\bNSUnarchiver\b')
+  [[ -n "$res" ]] && add_finding "Deserialization" "high" "high" "low" \
+    "Deprecated NSKeyedUnarchiver/NSUnarchiver API used — no class allowlisting, unsafe on untrusted data" "$res"
+
+  # Same trigger co-occurring with an untrusted-source keyword on one line — elevates to critical.
+  # Under-recalls by design (source assignment is usually on a separate line); treat absence of
+  # this finding as inconclusive, not as proof the data source is trusted.
+  res=$(proximity -i 'unarchiveObjectWithData|unarchiveObjectWithFile|unarchiveTopLevelObjectWithData|unarchiveObject\(with:|unarchiveObject\(withFile:' \
+                  'pasteboard|didReceiveData|URLSession|downloadTask|contentsOf|webView|IPC|XPC|extensionContext|response')
+  [[ -n "$res" ]] && add_finding "Deserialization" "critical" "medium" "medium" \
+    "Insecure unarchiver fed by a likely-untrusted source (network/IPC/pasteboard/extension) — high-value RCE surface" "$res"
+
+  # Global absence of NSSecureCoding adoption despite NSCoding usage (absence-based, low confidence)
+  has_nscoding=$(match -i '<NSCoding>|:\s*NSCoding\b|decodeObjectForKey:|decodeObject\(forKey:')
+  has_securecoding=$(match -i 'NSSecureCoding|supportsSecureCoding|decodeObject\(of:|decodeObjectOfClass')
+  if [[ -n "$has_nscoding" && -z "$has_securecoding" ]]; then
+    add_finding "Deserialization" "low" "low" "high" \
+      "NSCoding usage found but no NSSecureCoding/decodeObject(of:) adoption anywhere — classes may be exploitable via arbitrary-class substitution" \
+      "$has_nscoding"
+  fi
+
+  echo
+fi
+
+# =====================================================================
+# 14. Unsafe Parsing / Archive Handling (XXE, Zip Slip)
+# =====================================================================
+if [[ "$DO_ALL" == true || "$DO_PARSING" == true ]]; then
+  echo "--- Unsafe Parsing / Archive Handling ---"
+
+  # XXE: NSXMLParser external-entity delegate override present
+  res=$(match -i 'shouldProcessExternalEntities')
+  [[ -n "$res" ]] && add_finding "Parsing" "medium" "medium" "medium" \
+    "NSXMLParser shouldProcessExternalEntities delegate present — verify it does not return true (XXE)" "$res"
+
+  # Explicit true/YES on the same line — stronger signal (under-recalls multi-line cases)
+  res=$(proximity -i 'shouldProcessExternalEntities' 'true|YES|return true')
+  [[ -n "$res" ]] && add_finding "Parsing" "high" "medium" "low" \
+    "shouldProcessExternalEntities returns true — XXE: external entities can read local files / reach internal URLs" "$res"
+
+  # Legacy third-party XML libraries (historically XXE-prone by default, version-dependent)
+  res=$(match 'GDataXMLDocument|TouchXML|KissXML|CXMLDocument')
+  [[ -n "$res" ]] && add_finding "Parsing" "low" "medium" "medium" \
+    "Legacy XML library (GDataXML/TouchXML/KissXML) — historically XXE-prone by default; verify version and entity handling" "$res"
+
+  # Raw libxml2 dangerous entity/DTD flags. Deliberately excludes XML_PARSE_NONET (protective, not dangerous).
+  res=$(match 'XML_PARSE_NOENT|XML_PARSE_DTDLOAD|XML_PARSE_DTDVALID')
+  [[ -n "$res" ]] && add_finding "Parsing" "high" "medium" "low" \
+    "libxml2 parsed with entity/DTD-loading flags (XML_PARSE_NOENT/DTDLOAD/DTDVALID) — XXE risk" "$res"
+
+  # Zip Slip: archive-extraction library present
+  archive_lib=$(match 'SSZipArchive|ZipArchive\b|ZIPFoundation|Zip\.quickUnzipFile|Zip\.unzipFile|unzipOpenCurrentFile')
+  [[ -n "$archive_lib" ]] && add_finding "Parsing" "low" "medium" "medium" \
+    "Archive-extraction library detected — verify entry paths are validated before writing to disk (Zip Slip)" "$archive_lib"
+
+  # Zip Slip: archive lib present with no visible path-sanitization evidence anywhere in the app.
+  # Absence-based and version-dependent (e.g. SSZipArchive >=2.2.3 fixed Zip Slip internally) —
+  # cross-reference detect-sdks.sh --check-cves for the actual linked version before raising severity.
+  path_validation=$(match -i 'standardizingPath|resolvingSymlinksInPath|containsString\("\.\."\)|hasPrefix\(destinationPath\)|canonicalPath|isSubdirectory')
+  if [[ -n "$archive_lib" && -z "$path_validation" ]]; then
+    add_finding "Parsing" "medium" "low" "high" \
+      "Archive-extraction library present with no path-sanitization evidence — possible Zip Slip (verify library version via detect-sdks.sh --check-cves; some versions patch this internally)" \
+      "$archive_lib"
+  fi
 
   echo
 fi

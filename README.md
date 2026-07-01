@@ -7,7 +7,7 @@ A comprehensive [Claude Code skill](https://docs.anthropic.com/en/docs/claude-co
 - **IPA/App Extraction** — Unpack IPA archives and .app bundles, dump Objective-C/Swift class headers via `ipsw class-dump`, extract Info.plist, entitlements, embedded frameworks, and string constants
 - **API Endpoint Discovery** — Find HTTP endpoints across URLSession, Alamofire, Moya, AFNetworking, GraphQL, and WebSocket patterns
 - **Call Flow Tracing** — Follow execution paths from ViewControllers through ViewModels/Presenters down to the networking layer
-- **Security Auditing** — Scan for ATS exceptions, certificate pinning issues, weak crypto, keychain misuse, jailbreak detection, and debug artifacts
+- **Security Auditing** — Scan for ATS exceptions, certificate pinning issues, weak crypto, keychain misuse, jailbreak detection, debug artifacts, insecure deserialization, XXE, and Zip Slip
 - **Cloud Credential Scanning** — Deep-scan for leaked API keys and secrets from Firebase, AWS, GCP, Azure, Stripe, Twilio, SendGrid, and more — with LLM-assisted risk classification
 - **Deep Binary Reversing** — Decompile functions, trace cross-references, and analyze crypto/auth/network code using radare2, rizin, or Ghidra headless
 - **SDK Fingerprinting** — Identify all embedded third-party SDKs, detect versions, and cross-reference with known CVEs
@@ -211,6 +211,27 @@ Detects anti-tampering mechanisms and outputs a protection score (0-20):
 | 1-4 | Lightly protected |
 | 0 | Unprotected |
 
+#### 9. Static Vulnerability Audit
+> "Audit this app for iOS vulnerability classes"
+
+Hunts vulnerability *patterns* (not API calls or credential values) across 14 categories, each finding tagged with Severity, Confidence, and FP-likelihood so you can triage signal strength instead of treating every match as confirmed:
+
+- `--storage` — UserDefaults secrets, weak Keychain accessibility, unencrypted local DBs, backup-exclusion absence, App-Group `UserDefaults` secret exposure
+- `--webview` — `UIWebView`, file/universal access flags, JS-bridge handlers, TLS-bypassing auth challenge handlers
+- `--deeplink` — custom URL schemes, tokens passed through deeplink callbacks, universal links
+- `--crypto` — ECB mode, non-CSPRNG for tokens, MD5/SHA1, hardcoded IV/salt
+- `--auth` — biometric bypass patterns, Sign in with Apple nonce absence
+- `--logging` — secrets logged via `print`/`NSLog`/`os_log`
+- `--network` — ATS exceptions, cleartext/insecure-WebSocket, custom trust bypass, third-party certificate-pinning misconfiguration (AFNetworking/TrustKit/Alamofire), permanently-persisted `URLCredential`
+- `--privacy` — IDFA without ATT, sensitive pasteboard use, screen-capture and app-switcher/background-snapshot leaks, `LSApplicationQueriesSchemes` fingerprinting, Apple privacy manifest checks
+- `--entitlements` — disabled library validation, app groups, shared keychain groups
+- `--debug` — debug-gated insecure behavior, staging/internal URLs
+- `--hardening` — Mach-O PIE / hardened-runtime flags
+- `--injection` — NSPredicate/NSExpression, KVC, NSSelectorFromString/performSelector, stringWithFormat
+- `--deserialization` — deprecated `NSKeyedUnarchiver`/`NSUnarchiver` APIs, missing `NSSecureCoding`
+- `--parsing` — XXE (`NSXMLParser`/libxml2), Zip Slip in archive extraction
+- `--all` — every category (default); `--severity LEVEL` filters by minimum severity; `--report FILE` exports Markdown
+
 ### Generating Reports
 
 Most analysis scripts support `--report <file.md>` to generate structured Markdown reports:
@@ -237,6 +258,9 @@ iOS-claude-skill/
 │       │   ├── reversing-analyze.sh # Binary reversing with r2/Ghidra
 │       │   ├── detect-sdks.sh       # SDK fingerprinting
 │       │   ├── detect-protections.sh# Protection detection
+│       │   ├── audit-vulnerabilities.sh # Static vulnerability audit (14 categories)
+│       │   ├── lib/
+│       │   │   └── plist.sh         # Portable plist readers (macOS + Linux)
 │       │   └── ghidra/              # Ghidra headless Java scripts
 │       │       ├── DecompileAllFunctions.java
 │       │       ├── FindSecrets.java
@@ -251,7 +275,8 @@ iOS-claude-skill/
 │           ├── cloud-secrets-patterns.md
 │           ├── reversing-tools-guide.md
 │           ├── sdk-fingerprinting.md
-│           └── anti-tampering-patterns.md
+│           ├── anti-tampering-patterns.md
+│           └── vulnerability-patterns.md
 ├── LICENSE                          # Unlicense (public domain)
 └── README.md
 ```
